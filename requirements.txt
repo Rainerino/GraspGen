@@ -1,4 +1,3 @@
-pickle5
 h5py
 hydra-core
 matplotlib
@@ -22,3 +21,5 @@ tensorboardx
 sharedarray
 torch-geometric
 yourdfpy==0.0.56
+qpsolvers[open_source_solvers]
+torch-scatter
