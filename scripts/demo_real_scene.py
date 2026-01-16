@@ -157,7 +157,7 @@ def parse_args():
     parser.add_argument(
         "--num_grasps",
         type=int,
-        default=1,
+        default=10,
         help="Number of grasps to generate",
     )
     parser.add_argument(
@@ -345,6 +345,21 @@ if __name__ == "__main__":
                     gripper_name=gripper_name,
                     linewidth=1.5,
                 )
+
+                # # Visualize gripper collision mesh at this grasp pose
+                # T_grasp = tra.inverse_matrix(T_center) @ grasp
+                # # Move gripper closer to object along approach direction (z-axis negative direction)
+                # # Adjust this offset value to move gripper closer/farther from object
+                # approach_offset = -0.05  # Move 2cm closer to object along approach direction
+                # T_offset = tra.translation_matrix([0, 0, -approach_offset])
+                # T_grasp_adjusted = T_grasp @ T_offset
+                # visualize_mesh(
+                #     vis,
+                #     f"grasps/{j:03d}/gripper_collision_mesh",
+                #     gripper_collision_mesh,
+                #     color=[255, 0, 255],  # Magenta color
+                #     transform=T_grasp_adjusted.astype(float),
+                # )
 
                 T = tra.inverse_matrix(T_center) @ grasp
                 R = T[:3, :3]

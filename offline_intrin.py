@@ -24,9 +24,10 @@ def warp_mask_to_depth(
     将 mask 对齐到 depth 尺寸(out_hw=(H,W))，支持：
       - rgb_nonblack：你的mask是RGB图，背景纯黑(0,0,0)，物体区域非黑 -> 前景
       - gray：普通灰度/二值mask，>bin_thresh -> 前景
-      - auto：自动判断（这里默认你就是 rgb_nonblack）
+      - binary：2D mask [H, W]，值为 1 的像素表示object区域（保留），其他像素被mask掉（排除）
+      - auto：自动判断（3通道->rgb_nonblack, 2D->binary, 其他->gray）
 
-    返回: (H_out, W_out) bool
+    返回: (H_out, W_out) bool，True表示保留的点（object区域），False表示被mask掉的点
     """
     if mask_img is None:
         raise ValueError("mask_img is None")
@@ -38,11 +39,13 @@ def warp_mask_to_depth(
         mask_rs = cv2.resize(mask_img, (W_out, H_out), interpolation=cv2.INTER_NEAREST)
     else:
         mask_rs = mask_img
-
+        
     if mode == "auto":
         # 有3通道优先按非黑，否则走灰度
         if mask_rs.ndim == 3 and mask_rs.shape[2] >= 3:
             mode = "rgb_nonblack"
+        elif mask_rs.ndim == 2:
+            mode = "binary"
         else:
             mode = "gray"
 
@@ -70,6 +73,36 @@ def warp_mask_to_depth(
             mb = (mg8 > 0)
         else:
             mb = (mg8 > int(bin_thresh))
+    
+    elif mode == "binary":
+        # 处理 [H, W] 形状的 mask，值为 1 的像素表示object区域（保留），其他像素被mask掉（排除）
+        if mask_rs.ndim != 2:
+            raise ValueError(f"binary mode expects 2D mask [H, W], got {mask_rs.shape}")
+        
+        # 转换为 uint8 以便处理
+        if mask_rs.dtype == np.uint16:
+            mask_u8 = (mask_rs / 257).astype(np.uint8)
+        else:
+            mask_u8 = mask_rs.astype(np.uint8)
+        
+        # 检查mask的值范围，用于调试
+        unique_vals = np.unique(mask_u8)
+        print(f"[DEBUG] binary mask unique values: {unique_vals}, shape: {mask_u8.shape}, min={mask_u8.min()}, max={mask_u8.max()}")
+        
+        # 值为 1 的像素表示object区域（保留），其他像素被mask掉（排除）
+        # 如果mask中没有值为1，检查是否有其他明显的object值（比如255）
+        if 1 in unique_vals:
+            # 值为1的地方是object区域，应该保留
+            mb = (mask_u8 == 1)
+            print(f"[DEBUG] binary mask: treating value 1 as object region (to be kept)")
+        elif 255 in unique_vals and len(unique_vals) <= 3:
+            # 如果mask是二值图（0和255），值为255的地方是object区域
+            mb = (mask_u8 == 255)
+            print(f"[DEBUG] binary mask: treating 255 as object region (to be kept)")
+        else:
+            # 默认：值大于0的像素是object区域，值为0的像素被mask掉
+            mb = (mask_u8 > 0)
+            print(f"[DEBUG] binary mask: treating non-zero values as object region (to be kept)")
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -104,6 +137,25 @@ def maybe_invert_mask(mask: np.ndarray, mode: str = "keep") -> np.ndarray:
 # ============================================================
 # 2) depth + K + w2c -> 世界点（同时返回 uv 以便从图像采色）
 # ============================================================
+def fill_invalid_depth(depth: np.ndarray, default_value: float = 1e-5) -> np.ndarray:
+    """
+    将无效的 depth 值（NaN、inf 或 <= 1e-6）替换为默认值，确保所有像素都能生成点云。
+    
+    Args:
+        depth: 2D depth 图像
+        default_value: 用于替换无效值的默认值，默认 1e-5（需要大于 1e-6 以通过有效性检查）
+    
+    Returns:
+        处理后的 depth 图像
+    """
+    depth_filled = depth.copy()
+    invalid_mask = ~(np.isfinite(depth) & (depth > 1e-6))
+    if invalid_mask.any():
+        depth_filled[invalid_mask] = default_value
+        print(f"[DEPTH FILL] Filled {invalid_mask.sum()} invalid depth pixels with {default_value}")
+    return depth_filled
+
+
 def backproject_points_with_uv(depth: np.ndarray, K: np.ndarray, w2c_3x4: np.ndarray, mask: np.ndarray):
     if depth.ndim != 2:
         raise ValueError(f"depth must be 2D (H,W), got {depth.shape}")
@@ -130,6 +182,8 @@ def backproject_points_with_uv(depth: np.ndarray, K: np.ndarray, w2c_3x4: np.nda
     c2w = np.linalg.inv(w2c)
 
     cam_h = np.concatenate([cam, np.ones((cam.shape[0], 1), np.float32)], axis=1)
+    print(f"cam_h: {cam_h.shape}")
+    print(f"c2w: {c2w.shape}")
     world = (c2w @ cam_h.T).T[:, :3].astype(np.float32)
     return world, (u, v)
 
@@ -138,8 +192,16 @@ def sample_rgb01(img_bgr: np.ndarray, uv):
     u, v = uv
     if len(u) == 0:
         return np.zeros((0, 3), np.float32)
+    
+    # 验证尺寸一致性
+    H_img, W_img = img_bgr.shape[:2]
+    u_max, v_max = u.max(), v.max()
+    if u_max >= W_img or v_max >= H_img:
+        raise ValueError(f"UV coordinates out of bounds: u_max={u_max} >= W={W_img}, v_max={v_max} >= H={H_img}")
+    
+    # 采样 RGB 颜色（v 是行索引，u 是列索引）
     bgr = img_bgr[v, u, :3].astype(np.float32)
-    rgb = bgr[:, ::-1] / 255.0
+    rgb = bgr[:, ::-1] / 255.0  # BGR -> RGB
     return rgb
 
 
@@ -183,14 +245,26 @@ def build_target_json(
     object_pc_color01: np.ndarray,
     grasp_poses: np.ndarray | None,
     grasp_conf: np.ndarray | None,
-    img_depth0: np.ndarray,
-    img_color0_bgr: np.ndarray,
+    img_depth0: np.ndarray | None,
+    img_color0_bgr: np.ndarray | None,
     full_pc0: np.ndarray,
-    obj_mask0_u8: np.ndarray,
+    obj_mask0_u8: np.ndarray | None,
 ):
     grasp_poses_list = [] if grasp_poses is None else grasp_poses.tolist()
     grasp_conf_list = [] if grasp_conf is None else grasp_conf.tolist()
     pc_color_u8 = colors01_to_u8(object_pc_color01)
+
+    scene_info = {
+        "full_pc": [full_pc0.astype(np.float32).tolist()],
+    }
+    
+    # 保存图像数据（这些数据很大，但需要保存）
+    if img_depth0 is not None:
+        scene_info["img_depth"] = img_depth0.astype(np.float32).tolist()
+    if img_color0_bgr is not None:
+        scene_info["img_color"] = img_color0_bgr.astype(np.uint8).tolist()  # 维持你原来的写法（BGR）
+    if obj_mask0_u8 is not None:
+        scene_info["obj_mask"] = obj_mask0_u8.astype(np.uint8).tolist()
 
     return {
         "object_info": {
@@ -201,12 +275,7 @@ def build_target_json(
             "grasp_poses": grasp_poses_list,
             "grasp_conf": grasp_conf_list,
         },
-        "scene_info": {
-            "img_depth": img_depth0.astype(np.float32).tolist(),
-            "img_color": img_color0_bgr.astype(np.uint8).tolist(),  # 维持你原来的写法（BGR）
-            "full_pc": [full_pc0.astype(np.float32).tolist()],
-            "obj_mask": obj_mask0_u8.astype(np.uint8).tolist(),
-        }
+        "scene_info": scene_info,
     }
 
 
@@ -230,17 +299,21 @@ def main(
     camera_json_path: str,
     mask_dir: str,
     export_dir: str,
-    mask_mode: str = "rgb_nonblack",   # 你的mask类型
+    mask_mode: str = "auto",   # 你的mask类型
     nonblack_thresh: int = 10,
     invert_mode: str = "keep",
     voxel_size: float = 0.005,
     bin_thresh: int = 0,
     morph_close: int = 0,
     morph_open: int = 0,
+    downsample_ratio: float = 1.0,  # 图像降采样比率（先对image和mask进行等比例放缩，然后再映射到点云），1.0表示不下采样，0.5表示保留50%的像素
+    scene_downsample_ratio: float | None = None,  # scene_info中full_pc的降采样比率，None表示使用downsample_ratio
+    # save_images_to_json: bool = True,  # 是否将img_depth、img_color、obj_mask保存到JSON（这些数据很大）
 ):
     os.makedirs(export_dir, exist_ok=True)
 
     cams, Ks, w2cs = load_cameras(camera_json_path)
+    Ks_orig = [K.copy() for K in Ks]  # 保存原始内参，供 scene_info 使用
 
     # 以 depth_*.npy 文件为准决定要处理哪些 idx（避免 json 有很多条但目录只有 0000）
     depth_files = sorted(glob.glob(os.path.join(depth_dir, "depth_*.npy")))
@@ -266,6 +339,7 @@ def main(
 
     # ---------- 多视角 object 点云 ----------
     all_pts, all_cols = [], []
+    processed_indices = []  # 记录成功处理的索引
     for i in indices:
         rgb = cv2.imread(rgb_paths[i], cv2.IMREAD_COLOR)
         if rgb is None:
@@ -273,6 +347,13 @@ def main(
             continue
 
         depth = np.load(dep_paths[i]).astype(np.float32)
+        # 处理 3D depth (H, W, 1) 或 (H, W, C)
+        if depth.ndim == 3:
+            if depth.shape[2] == 1:
+                depth = depth[:, :, 0]  # 压缩单通道维度
+            else:
+                depth = depth[:, :, 0]  # 如果有多个通道，取第一个
+        # 处理 1D depth
         if depth.ndim == 1:
             Hr, Wr = rgb.shape[:2]
             if depth.size == Hr * Wr:
@@ -285,13 +366,43 @@ def main(
         H, W = depth.shape
 
         # rgb 统一到 depth 分辨率，避免 uv 采色错位/越界
+        # 使用 INTER_LINEAR 保持质量同时减少对齐误差（如果要求严格对齐，可使用 INTER_NEAREST）
         if rgb.shape[:2] != (H, W):
-            rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_AREA)
+            rgb = cv2.resize(rgb, (W, H), interpolation=cv2.INTER_LINEAR)
 
         mask_img = cv2.imread(msk_paths[i], cv2.IMREAD_UNCHANGED)
         if mask_img is None:
             print("[WARN] missing mask:", msk_paths[i])
             continue
+
+        # 图像空间降采样：先对 image 和 mask 进行等比例放缩，然后再映射到点云
+        K_orig = Ks_orig[i].copy()  # 使用原始内参
+        if downsample_ratio < 1.0 and downsample_ratio > 0.0:
+            # 计算新的图像尺寸
+            H_new = int(H * np.sqrt(downsample_ratio))
+            W_new = int(W * np.sqrt(downsample_ratio))
+            # 确保尺寸为正且不超出原始尺寸
+            H_new = max(1, min(H_new, H))
+            W_new = max(1, min(W_new, W))
+            
+            # 等比例缩放 depth、rgb、mask
+            # 注意：为了确保 RGB 和 depth 像素位置完全对齐，rgb 也使用 INTER_NEAREST
+            if (H_new, W_new) != (H, W):
+                depth = cv2.resize(depth, (W_new, H_new), interpolation=cv2.INTER_NEAREST)
+                rgb = cv2.resize(rgb, (W_new, H_new), interpolation=cv2.INTER_NEAREST)  # 使用 NEAREST 确保与 depth 对齐
+                mask_img = cv2.resize(mask_img, (W_new, H_new), interpolation=cv2.INTER_NEAREST)
+            
+            # 调整内参 K（fx, fy, cx, cy 都需要乘以缩放比例）
+            scale_h = H_new / H
+            scale_w = W_new / W
+            K_new = K_orig.copy()
+            K_new[0, 0] *= scale_w  # fx
+            K_new[1, 1] *= scale_h  # fy
+            K_new[0, 2] *= scale_w  # cx
+            K_new[1, 2] *= scale_h  # cy
+            Ks[i] = K_new
+            H, W = H_new, W_new
+            print(f"[view {i}] image downsampled to {H}x{W} (ratio={downsample_ratio:.2f}, scale={scale_h:.3f}x{scale_w:.3f})")
 
         # 你的 mask 是 RGB 黑底图，所以按非黑像素生成 bool mask
         mask = warp_mask_to_depth(
@@ -323,25 +434,38 @@ def main(
 
         all_pts.append(pts)
         all_cols.append(cols)
+        processed_indices.append(i)  # 记录成功处理的索引
 
     if not all_pts:
         raise RuntimeError("No points recovered. Check mask generation / mask file content.")
 
     obj_pts = np.concatenate(all_pts, axis=0).astype(np.float32)
     obj_cols = np.concatenate(all_cols, axis=0).astype(np.float32)
-    print("[OBJ] pc:", obj_pts.shape, "pc_color:", obj_cols.shape)
+    print("[OBJ] pc (after image-space downsample):", obj_pts.shape, "pc_color:", obj_cols.shape)
 
     save_ply_xyzrgb(obj_pts, obj_cols, os.path.join(export_dir, "object_pc_rgb.ply"))
     obj_pts_down, obj_cols_down = voxel_downsample_xyzrgb(obj_pts, obj_cols, voxel_size=voxel_size)
     save_ply_xyzrgb(obj_pts_down, obj_cols_down, os.path.join(export_dir, "object_pc_rgb_down.ply"))
 
     # ---------- 第0视角 scene_info ----------
-    i0 = indices[0]
+    # 使用第一个成功处理的索引，如果没有则使用原始索引列表的第一个
+    if not processed_indices:
+        raise RuntimeError("No valid views processed. Cannot generate scene_info.")
+    i0 = processed_indices[0]
+    if i0 not in rgb_paths:
+        raise KeyError(f"Index {i0} not found in rgb_paths. Available indices: {list(rgb_paths.keys())}")
     rgb0 = cv2.imread(rgb_paths[i0], cv2.IMREAD_COLOR)
     if rgb0 is None:
         raise FileNotFoundError(rgb_paths[i0])
 
     depth0 = np.load(dep_paths[i0]).astype(np.float32)
+    # 处理 3D depth (H, W, 1) 或 (H, W, C)
+    if depth0.ndim == 3:
+        if depth0.shape[2] == 1:
+            depth0 = depth0[:, :, 0]  # 压缩单通道维度
+        else:
+            depth0 = depth0[:, :, 0]  # 如果有多个通道，取第一个
+    # 处理 1D depth
     if depth0.ndim == 1:
         Hr, Wr = rgb0.shape[:2]
         if depth0.size == Hr * Wr:
@@ -351,13 +475,53 @@ def main(
     if depth0.ndim != 2:
         raise ValueError(f"[view {i0}] depth must be HxW, got {depth0.shape}")
 
-    H0, W0 = depth0.shape
+    H0_orig, W0_orig = depth0.shape  # 保存原始尺寸
+    print(f"[SCENE] Original depth0 shape: {H0_orig}x{W0_orig} = {H0_orig * W0_orig} pixels")
+    H0, W0 = H0_orig, W0_orig
+    # rgb 统一到 depth 分辨率，使用 INTER_LINEAR 保持质量同时减少对齐误差
     if rgb0.shape[:2] != (H0, W0):
-        rgb0 = cv2.resize(rgb0, (W0, H0), interpolation=cv2.INTER_AREA)
+        rgb0 = cv2.resize(rgb0, (W0, H0), interpolation=cv2.INTER_LINEAR)
 
     mask0_img = cv2.imread(msk_paths[i0], cv2.IMREAD_UNCHANGED)
     if mask0_img is None:
         raise FileNotFoundError(msk_paths[i0])
+
+    # scene_info 的图像空间降采样（使用原始内参）
+    K0_orig = Ks_orig[i0].copy()
+    scene_ratio = scene_downsample_ratio if scene_downsample_ratio is not None else downsample_ratio
+    if scene_ratio < 1.0 and scene_ratio > 0.0:
+        # 计算新的图像尺寸
+        H0_new = int(H0 * np.sqrt(scene_ratio))
+        W0_new = int(W0 * np.sqrt(scene_ratio))
+        # 确保尺寸为正且不超出原始尺寸
+        H0_new = max(1, min(H0_new, H0))
+        W0_new = max(1, min(W0_new, W0))
+        
+        # 等比例缩放 depth0、rgb0、mask0_img
+        # 注意：为了确保 RGB 和 depth 像素位置完全对齐，rgb0 也使用 INTER_NEAREST
+        if (H0_new, W0_new) != (H0, W0):
+            # 检查降采样前的有效 depth 值数量
+            depth_valid_before = np.isfinite(depth0) & (depth0 > 1e-6)
+            print(f"[SCENE] Before downsample: depth shape {H0}x{W0}, valid pixels: {depth_valid_before.sum()}/{depth0.size}")
+            depth0 = cv2.resize(depth0, (W0_new, H0_new), interpolation=cv2.INTER_NEAREST)
+            rgb0 = cv2.resize(rgb0, (W0_new, H0_new), interpolation=cv2.INTER_NEAREST)  # 使用 NEAREST 确保与 depth 对齐
+            mask0_img = cv2.resize(mask0_img, (W0_new, H0_new), interpolation=cv2.INTER_NEAREST)
+        # 检查降采样后的有效 depth 值数量
+        depth_valid_after = np.isfinite(depth0) & (depth0 > 1e-6)
+        print(f"[SCENE] After downsample: depth shape {H0_new}x{W0_new}, valid pixels: {depth_valid_after.sum()}/{depth0.size}")
+        
+        # 调整内参 K
+        scale_h0 = H0_new / H0_orig  # 使用原始尺寸计算缩放比例
+        scale_w0 = W0_new / W0_orig
+        K0_new = K0_orig.copy()
+        K0_new[0, 0] *= scale_w0  # fx
+        K0_new[1, 1] *= scale_h0  # fy
+        K0_new[0, 2] *= scale_w0  # cx
+        K0_new[1, 2] *= scale_h0  # cy
+        H0, W0 = H0_new, W0_new
+        print(f"[SCENE] image downsampled to {H0}x{W0} (ratio={scene_ratio:.2f}, scale={scale_h0:.3f}x{scale_w0:.3f})")
+    else:
+        K0_new = K0_orig
 
     obj_mask0 = warp_mask_to_depth(
         mask0_img,
@@ -372,8 +536,25 @@ def main(
     obj_mask0_u8 = obj_mask0.astype(np.uint8)
 
     full_mask0 = np.ones((H0, W0), dtype=bool)
-    full_pc0, _ = backproject_points_with_uv(depth0, Ks[i0], w2cs[i0], full_mask0)
-    print("[SCENE] depth0:", depth0.shape, "rgb0:", rgb0.shape, "full_pc0:", full_pc0.shape)
+    # 检查 depth0 的有效值
+    depth_valid = np.isfinite(depth0) & (depth0 > 1e-6)
+    n_invalid = depth0.size - depth_valid.sum()
+    print(f"[SCENE] depth0 shape: {depth0.shape}, total pixels: {depth0.size}, valid: {depth_valid.sum()}, invalid: {n_invalid}")
+    
+    # 将无效的 depth 值替换为默认值（1e-5，略大于 1e-6 以通过有效性检查），确保所有像素都能生成点云
+    if n_invalid > 0:
+        depth0_filled = fill_invalid_depth(depth0, default_value=1e-5)
+    else:
+        depth0_filled = depth0
+    
+    full_pc0, _ = backproject_points_with_uv(depth0_filled, K0_new, w2cs[i0], full_mask0)
+    print("[SCENE] depth0:", depth0.shape, "rgb0:", rgb0.shape, "full_pc0 (after image-space downsample):", full_pc0.shape)
+    expected_points = H0 * W0
+    actual_points = len(full_pc0)
+    if expected_points != actual_points:
+        print(f"[SCENE WARN] Expected points: {expected_points}, Actual points: {actual_points}, Difference: {expected_points - actual_points}")
+    else:
+        print(f"[SCENE OK] Point count matches: {actual_points} = {H0} * {W0}")
 
     # ---------- grasp_info 先留空 ----------
     grasp_poses = None
@@ -402,11 +583,14 @@ if __name__ == "__main__":
         depth_dir="assets/input/inputdata",
         camera_json_path="assets/input/camera_params.json",
         mask_dir="assets/input/inputdata",
-        export_dir="./output_offline",
-        mask_mode="rgb_nonblack",   # 你的mask：黑底RGB
+        export_dir="/home/xuran-yao/code/june_serve/GraspGen/GraspGenModels/sample_data/real_scene_pc/real_scene",
+        mask_mode="auto",   # 你的mask：黑底RGB
         nonblack_thresh=10,         # 如果物体比较暗可调小到 3-5
         invert_mode="keep",         # 先 keep，别 auto
         voxel_size=0.005,
         morph_close=0,              # 例如 5：填小洞
         morph_open=0,               # 例如 3：去噪点
+        downsample_ratio=0.1,       # 点云下采样比率，1.0表示不下采样，0.5表示保留50%的点
+        scene_downsample_ratio=1, # scene_info中full_pc的下采样比率
+        # save_images_to_json=False,   # 是否将img_depth、img_color、obj_mask保存到JSON（这些数据很大，建议False）
     )

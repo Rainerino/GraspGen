@@ -308,3 +308,20 @@ If you found this work to be useful, please considering citing:
 
 Please reach out to [Adithya Murali](http://adithyamurali.com) (admurali@nvidia.com) for further enquiries.
 
+## Offline Intrinsic Processing
+
+The `offline_intrin.py` script processes RGB images, depth maps, masks, and camera parameters to generate point clouds and scene JSON files for grasp inference. 
+
+**Required Input Files:**
+
+1. **RGB images directory** (`rgb_dir`): Contains RGB images named as `rgb_0000.png`, `rgb_0001.png`, etc.
+2. **Depth maps directory** (`depth_dir`): Contains depth maps saved as NumPy arrays named as `depth_0000.npy`, `depth_0001.npy`, etc. (2D arrays with shape `[H, W]`)
+3. **Mask images directory** (`mask_dir`): Contains mask images named as `mask_0000.png`, `mask_0001.png`, etc. Supports multiple formats:
+   - RGB non-black masks (background is black, object region retains RGB colors)
+   - Grayscale masks
+   - Binary masks
+4. **Camera parameters JSON file** (`camera_json_path`): A JSON array containing camera intrinsics and extrinsics for each view. Each entry should have:
+   - `intrinsics`: 3x3 camera intrinsic matrix `[[fx, 0, cx], [0, fy, cy], [0, 0, 1]]`
+   - `extrinsics`: 3x4 world-to-camera transformation matrix
+
+The script automatically processes all available depth files and matches them with corresponding RGB images, masks, and camera parameters. It supports image downsampling and point cloud voxel downsampling for efficient processing.
